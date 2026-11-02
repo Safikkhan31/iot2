@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: coldchain
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: coldchain
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro   # runs on first start only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldchain -d coldchain"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    environment:
+      ESP32_PASS: ${ESP32_MQTT_PASSWORD:?set ESP32_MQTT_PASSWORD in .env}
+      INGEST_PASS: ${INGEST_MQTT_PASSWORD:?set INGEST_MQTT_PASSWORD in .env}
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    ports:
+      - "1883:1883"
+    command: >
+      sh -c 'mosquitto_passwd -b -c /mosquitto/passwd esp32 "$$ESP32_PASS" &&
+             mosquitto_passwd -b /mosquitto/passwd ingest "$$INGEST_PASS" &&
+             exec mosquitto -c /mosquitto/config/mosquitto.conf'
+
+  mqtt-ingest:
+    build: ./mqtt-ingest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://coldchain:${POSTGRES_PASSWORD}@postgres:5432/coldchain
+      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_USER: ingest
+      MQTT_PASS: ${INGEST_MQTT_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://coldchain:${POSTGRES_PASSWORD}@postgres:5432/coldchain
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:3000
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  mosquitto-data:

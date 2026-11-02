@@ -1,0 +1,9 @@
+node_modules/
+.env
+frontend/dist/
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform/terraform.tfvars
+terraform/.terraform.lock.hcl.bak
+.image_tag

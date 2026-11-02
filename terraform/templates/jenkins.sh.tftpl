@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euxo pipefail
+exec > >(tee /var/log/jenkins-bootstrap.log) 2>&1
+
+for i in $(seq 1 40); do curl -s -m 3 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
+
+dnf install -y java-17-amazon-corretto-headless git
+curl -fsSL -o /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+dnf install -y jenkins
+systemctl enable --now jenkins

@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars and edit. Never commit terraform.tfvars.
+admin_cidrs = ["203.0.113.10/32"] # your public IP (search "what is my ip")
+
+# Optional
+# region        = "ap-south-1"
+# device_cidrs  = ["0.0.0.0/0"]   # narrow if your boxes have fixed IPs
+# webhook_cidrs = []               # GitHub webhook ranges, or leave empty and use SCM polling

@@ -1,0 +1,100 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/coldchain-bootstrap.log) 2>&1
+
+# Wait for outbound internet (the public IP or NAT can attach a few seconds after boot)
+for i in $(seq 1 40); do curl -s -m 3 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
+
+dnf install -y docker jq
+systemctl enable --now docker
+
+mkdir -p /opt/coldchain
+cat > /opt/coldchain/env <<'ENVEOF'
+ROLE=${role}
+REGION=${region}
+REGISTRY=${registry}
+REPO=${repo_url}
+DB_HOST=${db_host}
+DB_NAME=${db_name}
+DB_SECRET_ARN=${db_secret_arn}
+MQTT_SECRET_ARN=${mqtt_secret_arn}
+BACKEND_URL=http://${backend_dns}:3000
+ENVEOF
+
+# Deploy script. Jenkins runs it through SSM: /opt/coldchain/deploy.sh <image-tag>
+cat > /opt/coldchain/deploy.sh <<'DEPLOY'
+#!/bin/bash
+set -euo pipefail
+. /opt/coldchain/env
+TAG=latest
+if [ $# -ge 1 ]; then TAG=$1; fi
+case "$TAG" in *[!A-Za-z0-9._-]*) echo "bad tag"; exit 1;; esac
+
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY
+docker pull $REPO:$TAG   # if this fails, the running container is left untouched
+
+get_db_url() {
+  local S U P
+  S=$(aws secretsmanager get-secret-value --region $REGION --secret-id $DB_SECRET_ARN --query SecretString --output text)
+  U=$(echo "$S" | jq -r '.username | @uri')
+  P=$(echo "$S" | jq -r '.password | @uri')
+  echo "postgres://$U:$P@$DB_HOST:5432/$DB_NAME?sslmode=no-verify"
+}
+%{ if role == "backend" ~}
+
+docker rm -f backend 2>/dev/null || true
+docker run -d --name backend --restart unless-stopped -p 3000:3000 \
+  -e PORT=3000 -e DATABASE_URL="$(get_db_url)" $REPO:$TAG
+for i in $(seq 1 20); do
+  if curl -sf http://localhost:3000/health >/dev/null; then echo "backend healthy"; exit 0; fi
+  sleep 3
+done
+docker logs --tail 50 backend
+exit 1
+%{ endif ~}
+%{ if role == "frontend" ~}
+
+docker rm -f frontend 2>/dev/null || true
+docker run -d --name frontend --restart unless-stopped -p 80:80 -e BACKEND_URL=$BACKEND_URL $REPO:$TAG
+sleep 3
+curl -sf http://localhost/ >/dev/null && echo "frontend healthy"
+%{ endif ~}
+%{ if role == "ingest" ~}
+
+MQ=$(aws secretsmanager get-secret-value --region $REGION --secret-id $MQTT_SECRET_ARN --query SecretString --output text)
+INGEST_PW=$(echo "$MQ" | jq -r .ingest)
+docker rm -f mqtt-ingest 2>/dev/null || true
+docker run -d --name mqtt-ingest --restart unless-stopped --network cc \
+  -e DATABASE_URL="$(get_db_url)" -e MQTT_URL=mqtt://mosquitto:1883 \
+  -e MQTT_USER=ingest -e MQTT_PASS="$INGEST_PW" $REPO:$TAG
+sleep 3
+docker ps --filter name=mqtt-ingest --filter status=running | grep -q mqtt-ingest && echo "ingest running"
+%{ endif ~}
+DEPLOY
+chmod 700 /opt/coldchain/deploy.sh
+%{ if role == "ingest" ~}
+
+# MQTT broker (Mosquitto) runs next to the ingest service on this host
+. /opt/coldchain/env
+docker network create cc || true
+mkdir -p /opt/coldchain/mosquitto
+cat > /opt/coldchain/mosquitto/mosquitto.conf <<'MQCONF'
+listener 1883
+allow_anonymous false
+password_file /mosquitto/config/passwd
+persistence true
+persistence_location /mosquitto/data/
+MQCONF
+MQ=$(aws secretsmanager get-secret-value --region $REGION --secret-id $MQTT_SECRET_ARN --query SecretString --output text)
+ESP_PW=$(echo "$MQ" | jq -r .esp32)
+ING_PW=$(echo "$MQ" | jq -r .ingest)
+docker run --rm -v /opt/coldchain/mosquitto:/mosquitto/config eclipse-mosquitto:2 \
+  sh -c "mosquitto_passwd -b -c /mosquitto/config/passwd esp32 '$ESP_PW' && mosquitto_passwd -b /mosquitto/config/passwd ingest '$ING_PW'"
+chown 1883:1883 /opt/coldchain/mosquitto/passwd
+chmod 600 /opt/coldchain/mosquitto/passwd
+docker run -d --name mosquitto --restart unless-stopped --network cc -p 1883:1883 \
+  -v /opt/coldchain/mosquitto:/mosquitto/config -v mosquitto-data:/mosquitto/data eclipse-mosquitto:2
+%{ endif ~}
+
+# First boot: the registry is still empty, so this fails harmlessly until Jenkins pushes images.
+/opt/coldchain/deploy.sh latest || echo "No image yet. Run the Jenkins pipeline."

@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euxo pipefail
+exec > >(tee /var/log/agent-bootstrap.log) 2>&1
+
+for i in $(seq 1 40); do curl -s -m 3 -o /dev/null https://checkip.amazonaws.com && break; sleep 5; done
+
+dnf install -y java-17-amazon-corretto-headless git docker jq
+systemctl enable --now docker
+
+useradd -m -s /bin/bash jenkins
+usermod -aG docker jenkins
+install -d -m 700 -o jenkins -g jenkins /home/jenkins/.ssh
+cat > /home/jenkins/.ssh/authorized_keys <<'KEY'
+${public_key}
+KEY
+chown jenkins:jenkins /home/jenkins/.ssh/authorized_keys
+chmod 600 /home/jenkins/.ssh/authorized_keys
+
+# Values the Jenkinsfile reads
+mkdir -p /etc/coldchain
+cat > /etc/coldchain/env <<'ENVEOF'
+PROJECT=${project}
+AWS_REGION=${region}
+AWS_DEFAULT_REGION=${region}
+REGISTRY=${registry}
+DB_HOST=${db_host}
+DB_NAME=${db_name}
+DB_SECRET_ARN=${db_secret_arn}
+BACKEND_ID=${backend_id}
+FRONTEND_ID=${frontend_id}
+INGEST_ID=${ingest_id}
+ENVEOF
+chmod 644 /etc/coldchain/env
